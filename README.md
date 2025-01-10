@@ -1,4 +1,3 @@
-README.md template for your GitHub project. It assumes your HTML file represents a report or visualization of your project:
 
 markdown
 Copy code

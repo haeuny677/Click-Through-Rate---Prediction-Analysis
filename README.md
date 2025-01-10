@@ -1,6 +1,4 @@
 
-markdown
-Copy code
 # Click-Through Rate Prediction Analysis
 
 This repository contains a comprehensive analysis and predictive modeling project aimed at improving Click-Through Rate (CTR) predictions using machine learning techniques. The project uses R for data preprocessing, feature engineering, and modeling, with results documented in a detailed HTML report.

@@ -1,0 +1,418 @@
+---
+title: "APAN5200 Insights from CTR Prediction Analysis"
+author: 
+- "Professor Kitty Kay Chan"
+- "HaEun Yoon (hy2905)"
+date: "2024-11-26"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+## Introduction
+In today's digital landscape, creating successful advertisements requires a deep understanding of various factors that influence user interaction. Elements such as color schemes, word count, font size, and layout design play a critical role in attracting attention and driving engagement. To evaluate the effectiveness of an advertisement, one key metric is the Click-Through Rate (CTR), which measures the percentage of users who clicked on the ad after viewing it. This project focuses on predicting CTR using a dataset containing variables that may impact user behavior and traffic. By developing predictive models, this study aims to uncover insights into the factors that drive user engagement and optimize advertisement strategies.
+
+We are to build predictive models using the training data "analysis" to predict the CTR for the test data "scoring". The goal of this project was to minimize the RMSE, and be able to find the best predictive model. My best model had a Public score of **0.08279** and a Private score of **0.06826**.
+
+We start by loading the necessary libraries, and loading the data.
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library(caret)
+library(dplyr)
+library(xgboost)
+
+analysis <- read.csv('/Users/haeunyoon/Desktop/SCHOOL/AAFM/PAC/predicting-clicks/analysis_data.csv')
+scoring <- read.csv('/Users/haeunyoon/Desktop/SCHOOL/AAFM/PAC/predicting-clicks/scoring_data.csv')
+
+```
+
+A preview of the data we are working with:
+```{r, echo = FALSE, results = 'asis'}
+library(knitr)
+kable(analysis[1:3,],caption = "A sample of analysis data.")
+
+```
+## Data Exploration
+
+At first glance, we first need to **convert characters into factors** to better fit the models, and for R to see characters as categories. 
+```{r}
+analysis <- analysis %>% mutate(across(where(is.character), as.factor))
+scoring <- scoring %>% mutate(across(where(is.character), as.factor))
+```
+
+### Missing Data
+Our data contains missing values, which necessitates an appropriate imputation strategy to minimize their impact. For numerical columns with missing values, I have chosen to impute them with their respective **medians**. This approach is robust to outliers, ensuring that extreme values do not disproportionately influence the imputed data. For factor columns with missing values, I have opted to impute them with their **mode**, or most frequently occurring category. This method maintains consistency with the majority of the data, preserves categorical proportions, and reduces potential bias.
+```{r}
+calculate_mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+analysis <- analysis %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  mutate(across(where(is.factor), ~ ifelse(is.na(.), calculate_mode(.), .)))
+scoring <- scoring %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  mutate(across(where(is.factor), ~ ifelse(is.na(.), calculate_mode(.), .)))
+```
+Note that the `calculate_mode` calculates the mode of the vector.
+
+## Modeling
+
+### Exploratory Data Analysis
+After data cleansing, I've decided to check for correlation of predictors compared to CTR, and see which predictors have the highest correlation for me to use to build the best predictive model. 
+``` {r}
+correlations <- cor(analysis %>% select(where(is.numeric)), use = "complete.obs")
+ctr_correlations <- correlations[, "CTR"]
+```
+
+```{r, echo=FALSE}
+library(ggplot2)
+
+# Prepare data for plotting
+correlation_df <- data.frame(
+  Predictor = names(ctr_correlations),
+  Correlation = abs(ctr_correlations) # Take the absolute value of correlations
+)
+
+# Filter out 'CTR' (it has a perfect correlation with itself)
+correlation_df <- correlation_df %>%
+  filter(Predictor != "CTR") %>% # Exclude CTR from the data frame
+  mutate(Predictor = reorder(Predictor, Correlation)) %>% # Reorder for plotting
+  arrange(desc(Correlation)) # Arrange by absolute correlation
+
+# Create the plot
+ggplot(correlation_df, aes(x = Predictor, y = Correlation)) +
+  geom_bar(stat = "identity", fill = "steelblue") + # Bar plot
+  coord_flip() + # Flip coordinates for better readability
+  labs(
+    title = "Absolute Correlation of Predictors with CTR",
+    x = "Predictors",
+    y = "Absolute Correlation Coefficient"
+  ) +
+  theme_minimal() + # Minimal theme for a clean look
+  theme(
+    axis.text.x = element_text(size = 10), # Adjust x-axis text size
+    axis.text.y = element_text(size = 10)  # Adjust y-axis text size
+  )
+```
+
+Using this table, I chose to use the top 6 predictors that have the highest correlation to reduce overfitting. Shown here are the top 6 predictors.
+``` {r}
+# Filter and sort predictors by correlation with CTR, then take the top 6
+top_corr_predictors <- names(sort(abs(ctr_correlations), decreasing = TRUE)[2:7])
+
+# Select only these top 6 predictors in both train and scoring data
+train_data <- analysis %>% select(all_of(top_corr_predictors))
+scoring_data <- scoring %>% select(all_of(top_corr_predictors))  # Align predictors with train data
+```
+
+```{r, echo=FALSE}
+top_corr_predictors
+```
+
+I soon found out that in order to capture predictor's complex relationships, I could try exploring the complex relationship between predictors and CTR, which I did by adding polynomial (squared, cubic) and log transformations into the top 6 predictors.
+```{r}
+# Add polynomial (squared, cubic) and log transformations for top 6 predictors
+for (predictor in top_corr_predictors) {
+  # Polynomial features
+  train_data[[paste(predictor, "squared", sep = "_")]] <- train_data[[predictor]]^2
+  train_data[[paste(predictor, "cubed", sep = "_")]] <- train_data[[predictor]]^3
+  scoring_data[[paste(predictor, "squared", sep = "_")]] <- scoring_data[[predictor]]^2
+  scoring_data[[paste(predictor, "cubed", sep = "_")]] <- scoring_data[[predictor]]^3
+  
+  # Log transformation (adding a small constant to avoid log(0))
+  train_data[[paste(predictor, "log", sep = "_")]] <- log(train_data[[predictor]] + 1e-5)
+  scoring_data[[paste(predictor, "log", sep = "_")]] <- log(scoring_data[[predictor]] + 1e-5)
+}
+```
+This warning indicates that 'NaN' values were generated during the log transformation of both my 'train_data' and 'scoring_data'. Although this did not cause an error, it highlights an area for improvement as a key takeaway.
+
+Additionally, it imputes any remaining missing values (NAs) in numeric columns with the median of the respective column, calculated separately for the training and scoring datasets. This approach ensures the transformed data is free of NaNs, creating a more stable and reliable dataset for model training and prediction.
+```{r}
+# Impute any new NAs after transformations
+train_data <- train_data %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+scoring_data <- scoring_data %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+```
+
+I explored complex interaction terms for the top six predictors by generating pairwise interaction features for both the training and scoring datasets. These interaction terms allowed me to capture the combined effects of predictor pairs, potentially enhancing the model's predictive performance. After completing the transformations, including creating interaction terms and aligning column structures between the datasets, I prepared the training labels and constructed feature matrices using one-hot encoding ('model.matrix'). To ensure consistency, I aligned column orders and handled any missing columns between the training and scoring datasets before creating 'xgb.DMatrix' objects for use in my XGBoost model. 
+```{r}
+# Add interaction terms for top 6 predictors in the analysis and scoring datasets
+for (i in 1:(length(top_corr_predictors) - 1)) {
+  for (j in (i + 1):length(top_corr_predictors)) {
+    interaction_name <- paste(top_corr_predictors[i], top_corr_predictors[j], sep = "_x_")
+    train_data[[interaction_name]] <- analysis[[top_corr_predictors[i]]] * analysis[[top_corr_predictors[j]]]
+    scoring_data[[interaction_name]] <- scoring[[top_corr_predictors[i]]] * scoring[[top_corr_predictors[j]]]
+  }
+}
+```
+
+This graph shows the interaction between the top 6 predictors we have gathered. We can tell by the graph that the predictor 'visual_appeal' has the highest level of importance when interacting with other predictors. Therefore, we can focus on key interactions such as 'visual_appeal' x 'targeting_score' and 'visual_appeal' x 'ad_format'. 
+``` {r, echo=FALSE}
+# Load necessary libraries
+library(ggplot2)
+
+# Initialize a data frame to store interaction importance (correlation as a proxy)
+interaction_importance <- data.frame()
+
+# Compute interaction importance (e.g., absolute correlation with CTR as a metric)
+for (i in 1:(length(top_corr_predictors) - 1)) {
+  for (j in (i + 1):length(top_corr_predictors)) {
+    interaction_name <- paste(top_corr_predictors[i], top_corr_predictors[j], sep = "_x_")
+    # Create interaction terms
+    interaction_term <- analysis[[top_corr_predictors[i]]] * analysis[[top_corr_predictors[j]]]
+    # Calculate correlation with CTR as a proxy for importance
+    correlation <- abs(cor(interaction_term, analysis$CTR, use = "complete.obs"))
+    # Append to the interaction importance data frame
+    interaction_importance <- rbind(
+      interaction_importance,
+      data.frame(
+        Predictor1 = top_corr_predictors[i],
+        Predictor2 = top_corr_predictors[j],
+        Importance = correlation
+      )
+    )
+  }
+}
+
+# Create a complete grid for predictors to avoid NA issues
+all_predictors <- unique(c(interaction_importance$Predictor1, interaction_importance$Predictor2))
+grid <- expand.grid(Predictor1 = all_predictors, Predictor2 = all_predictors)
+
+# Merge the interaction importance into the grid (fill missing values with 0)
+interaction_complete <- merge(grid, interaction_importance, all.x = TRUE, by = c("Predictor1", "Predictor2"))
+interaction_complete$Importance[is.na(interaction_complete$Importance)] <- 0
+
+# Plot heatmap with color gradient
+ggplot(interaction_complete, aes(x = Predictor1, y = Predictor2, fill = Importance)) +
+  geom_tile() +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", na.value = "white") + # Color gradient
+  labs(
+    title = "Importance of Predictor Interactions",
+    x = "Predictor 1",
+    y = "Predictor 2",
+    fill = "Importance"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 14)
+  )
+```
+Here, I have chosen to prepare the data for XGBoost by assigning the target variable ('CTR'), converting the training and test datasets into numeric matrices using 'model.matrix', and aligning their features to ensure consistency. Missing columns in the test set are added with zeros, and the matrices are reordered to match. Finally, the data is converted into XGBoost's efficient 'DMatrix' format for training and prediction, ensuring compatibility and avoiding errors during modeling.
+```{r}
+# Set train_label after all transformations on train_data are complete
+train_label <- analysis$CTR  # This should refer to the CTR column in the original analysis data
+train_matrix <- model.matrix(~ . - 1, data = train_data)
+test_matrix <- model.matrix(~ . - 1, data = scoring_data)
+
+# Ensure columns in test_matrix align with train_matrix
+missing_cols <- setdiff(colnames(train_matrix), colnames(test_matrix))
+for (col in missing_cols) {
+  test_matrix <- cbind(test_matrix, rep(0, nrow(test_matrix)))
+  colnames(test_matrix)[ncol(test_matrix)] <- col
+}
+test_matrix <- test_matrix[, colnames(train_matrix)]  # Align column order
+
+# Check if lengths match
+if (nrow(train_matrix) != length(train_label)) stop("Mismatch between train_matrix and train_label rows")
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+dtest <- xgb.DMatrix(data = test_matrix)
+```
+
+I then tuned the hyperparameters for XGBoost to find the optimal settings for the best-performing model. This involved increasing the 'nrounds' (the number of training rounds) and decreasing the 'eta' (the learning rate) to reduce the risk of overfitting.
+```{r}
+param_grid <- expand.grid(
+  nrounds = as.integer(c(100, 200, 300)),
+  max_depth = c(4, 6),
+  eta = c(0.01, 0.1),
+  gamma = c(0),
+  colsample_bytree = c(0.8),
+  min_child_weight = c(1),
+  subsample = c(0.8),
+  lambda = c(0, 1),
+  alpha = c(0, 1)
+)
+```
+
+Before running XGBoost, perform **cross-validation using XGBoost** by calculating the cross-validated RMSE for each hyperparameter combination. Performing **K-fold cross-validation on XGBoost** ensures that you can achieve the lowest RMSE while reducing overfitting.
+```{r}
+# Function to perform cross-validation manually with xgboost
+perform_cv <- function(params) {
+  xgb_cv <- xgb.cv(
+    params = list(
+      objective = "reg:squarederror",
+      eta = params$eta,
+      max_depth = params$max_depth,
+      gamma = params$gamma,
+      colsample_bytree = params$colsample_bytree,
+      min_child_weight = params$min_child_weight,
+      subsample = params$subsample,
+      lambda = params$lambda,
+      alpha = params$alpha
+    ),
+    data = dtrain,
+    nrounds = as.numeric(params$nrounds),
+    nfold = 5,
+    verbose = 0
+  )
+  return(min(xgb_cv$evaluation_log$test_rmse_mean))
+}
+```
+
+Followed by evaluating each hyperparameter combination by tuning through Grid Search to set up to improve the model performance: 
+```{r}
+# Loop through each combination of parameters and keep track of performance
+results <- apply(param_grid, 1, function(row) {
+  params <- as.list(row)
+  params$nrounds <- as.numeric(params$nrounds)
+  error <- perform_cv(params)
+  c(params, rmse = error)
+})
+
+# Convert results to a data frame and find the best parameters
+results_df <- as.data.frame(do.call(rbind, results))
+best_params <- results_df[which.min(results_df$rmse), ]
+```
+
+Finally, training the tuned and cross-validation of XGboost with the cleansed train data:
+
+XGBoost was chosen as the best model for this analysis due to its exceptional performance and versatility in handling structured data. Its ability to handle missing values natively, through optimal tree-splitting decisions, ensures that the model can robustly handle any incomplete features in the dataset. XGBoost's regularization parameters, such as 'lambda' and 'alpha', help prevent overfitting, which is crucial for achieving a balance between bias and variance in complex datasets. Additionally, its support for hyperparameter tuning (e.g., 'eta', 'max_depth', and 'subsample') allows for fine-tuning the model to maximize predictive accuracy. The algorithm's gradient boosting mechanism effectively captures both linear and nonlinear relationships between predictors and the target variable ('CTR'), making it ideal for datasets with engineered features and interactions. 
+``` {r}
+final_xgb_model <- xgb.train(
+  params = list(
+    objective = "reg:squarederror",
+    eta = best_params$eta,
+    max_depth = best_params$max_depth,
+    gamma = best_params$gamma,
+    colsample_bytree = best_params$colsample_bytree,
+    min_child_weight = best_params$min_child_weight,
+    subsample = best_params$subsample,
+    lambda = best_params$lambda,
+    alpha = best_params$alpha
+  ),
+  data = dtrain,
+  nrounds = as.numeric(best_params$nrounds)
+)
+```
+
+Ultimately saving the cvs doc:
+```{r}
+# Make predictions
+scoring_pred <- predict(final_xgb_model, newdata = dtest)
+
+# Save predictions to CSV
+result <- data.frame(ID = scoring$id, CTR = scoring_pred)
+write.csv(result, '/Users/haeunyoon/Desktop/SCHOOL/AAFM/PAC/predicting-clicks/submission17_haeun.csv', row.names = FALSE)
+```
+
+
+## Areas of Improvements
+For areas of improvement, I would focus on starting with simpler models as a foundation before progressing to more complex ones. In tackling this project, I explored advanced models without fully understanding the data, such as what the predictors represented and how they related to the target variable. This lack of initial insight led me to rely heavily on concepts learned in class rather than tailoring my approach to the specific nature of the dataset. By first gaining a deeper understanding of the data—exploring distributions, relationships, and potential patterns—I could have better informed my modeling decisions. This approach would allow me to build models incrementally, ensuring that each step reflects the characteristics of the data and leads to more meaningful, interpretable, and effective results. This iterative process, starting with simpler models and gradually increasing complexity, would also help in identifying any potential issues earlier in the pipeline.
+
+In the data pre-processing stage of the code, I could have built a better model by addressing the missing values through imputation with the mean, median, or mode. This approach would likely be more effective, as it minimizes distortion of the feature distribution and reduces variability in the data. For this change, I would need to carefully consider the bias-variance tradeoff to create an optimal model that is general enough to perform well on the test data while also achieving strong predictive accuracy.
+```{r}
+# Set train_label after all transformations on train_data are complete
+train_label <- analysis$CTR  # This should refer to the CTR column in the original analysis data
+train_matrix <- model.matrix(~ . - 1, data = train_data)
+test_matrix <- model.matrix(~ . - 1, data = scoring_data)
+
+# Ensure columns in test_matrix align with train_matrix
+missing_cols <- setdiff(colnames(train_matrix), colnames(test_matrix))
+for (col in missing_cols) {
+  test_matrix <- cbind(test_matrix, rep(0, nrow(test_matrix)))
+  colnames(test_matrix)[ncol(test_matrix)] <- col
+}
+test_matrix <- test_matrix[, colnames(train_matrix)]  # Align column order
+
+# Check if lengths match
+if (nrow(train_matrix) != length(train_label)) stop("Mismatch between train_matrix and train_label rows")
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+dtest <- xgb.DMatrix(data = test_matrix)
+```
+
+## Other Models
+Some of the other predictive models that I have tried are evidence of how simple models sometimes outperform the complex ones. Other models that didn't were not that successful were the following models: 
+
+**Attempt 15 (Public Score of 0.08285, Private Score of 0.06883):**
+For Attempt 15, I had used the same method of cleaning data and data imputation. Impute numerical missing/NA data as the column's median and categorical data's missing/NA data as the column's mode. I then followed the same process of calculating correlation of predictors and CTR, and take the top 6 high correlations predictors. Explored interaction terms for among the top 6 predictors, and with that, I immediately prepared the data for XGBoost.
+```{r echo=FALSE, message=FALSE}
+# Load necessary libraries
+library(knitr)
+library(kableExtra)
+
+# Create a data frame to hold the comparison
+comparison_table <- data.frame(
+  Aspect = c("Feature Engineering", "Missing Value Handling", "Hyperparameter Tuning", 
+             "Output File", "Feature Importance"),
+  Attempt_15 = c("Only interaction terms.",
+                 "Imputed only before transformations.",
+                 "Numeric parameter conversions explicitly handled.",
+                 "`submission15_haeun.csv`",
+                 "Focused on fewer features."),
+  Attempt_17 = c("Interaction terms + polynomial (squared/cubic) and log transformations.",
+                 "Imputed both before and after transformations.",
+                 "Same logic, but applied to a more complex feature set.",
+                 "`submission17_haeun.csv`",
+                 "Focused on more features due to transformations.")
+)
+
+# Create and format the table
+kable(comparison_table, format = "html", escape = FALSE, col.names = c("Aspect", "Attempt 15", "Attempt 17")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, width = "30em") %>%
+  column_spec(3, width = "30em")
+
+```
+Attempt 17 is more comprehensive, incorporating nonlinear and interaction features that enhance the model's ability to capture complex relationships. The explicit handling of missing values after transformations ensures data consistency, reducing potential errors. These refinements are likely to result in better predictive performance, with a lower RMSE compared to previous attempts.
+
+
+**Attempt Bayesian Optimized Model (Public Score of 0.09575, Private Score of 0.08401):**
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(knitr)
+library(kableExtra)
+
+# Create a data frame for comparison
+comparison_table <- data.frame(
+  Aspect = c("Feature Engineering", "Missing Value Handling", "Hyperparameter Tuning", 
+             "Complexity of Features", "Optimization Method", "Computational Efficiency"),
+  Attempt_15 = c("Only interaction terms.", 
+                 "Imputed only before transformations.", 
+                 "Grid search with manually defined grid.", 
+                 "Simpler feature set (interaction terms only).", 
+                 "Manual parameter grid search.", 
+                 "Moderate: smaller feature set."),
+  Attempt_17 = c("Interaction terms + polynomial (squared/cubic) and log transformations.", 
+                 "Imputed both before and after transformations.", 
+                 "Grid search with similar logic applied to an expanded feature set.", 
+                 "More complex feature set with nonlinear transformations.", 
+                 "Manual parameter grid search.", 
+                 "Higher computational cost due to more features and transformations."),
+  Bayesian_Optimized_Model = c("No additional feature transformations; focused on raw features and their interactions.", 
+                               "Imputed only before transformations.", 
+                               "Bayesian optimization for hyperparameter tuning.", 
+                               "Relatively simpler feature set compared to Attempt 17.", 
+                               "Bayesian optimization for a more systematic, probabilistic approach.", 
+                               "Computationally efficient due to Bayesian optimization reducing iterations.")
+)
+
+# Generate the table
+kable(comparison_table, format = "html", escape = FALSE, col.names = c("Aspect", "Attempt 15", "Attempt 17", "Bayesian Optimized Model")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2:4, width = "25em")
+
+```
+Attempt 15 serves as a simpler baseline model, suitable for initial exploration but likely to underperform due to limited feature engineering and straightforward tuning. Attempt 17 introduces greater feature complexity with polynomial and log transformations, enhancing the model's ability to capture nonlinear patterns at a higher computational cost. The Bayesian Optimized Model, however, prioritizes efficient tuning and regularization over extensive feature transformations, offering a balanced and effective approach to optimizing performance.
+
+## Key Outcomes & Conclusion
+This competition highlighted the need to balance model complexity and performance. While complex models, such as those incorporating polynomial and interaction terms, can capture intricate relationships in the data, they are prone to overfitting. Overfitting occurs when a model becomes overly specific to the training data, capturing noise rather than patterns, leading to poor generalization on unseen data. Simpler models, by contrast, often outperformed their complex counterparts due to their robustness and ability to generalize.
+
+A key takeaway is the importance of addressing the bias-variance trade-off. Simpler models have higher bias but lower variance, making them less prone to overfitting, while complex models have lower bias but higher variance, increasing their susceptibility to overfitting. The goal is to find the right balance—minimizing bias without introducing excessive variance—to build a model that performs well on both training and test data.
+
+This project also emphasized the value of consistent data preprocessing, thoughtful feature engineering, and cross-validation. Handling missing values consistently, as done in Attempt 17, ensured clean, reliable data for modeling. Cross-validation proved invaluable for fine-tuning models and avoiding overfitting. Ultimately, this competition underscored the importance of aligning model complexity with problem requirements and focusing on generalizability to achieve real-world success.
